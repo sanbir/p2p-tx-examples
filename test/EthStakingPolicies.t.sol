@@ -38,6 +38,14 @@ interface IP2pOrgUnlimitedEthDepositor {
     function supportsInterface(bytes4) external view returns (bool);
 }
 
+struct SsvCluster {
+    uint32 validatorCount;
+    uint64 networkFeeIndex;
+    uint64 index;
+    bool   active;
+    uint256 balance;
+}
+
 interface IP2pSsvProxyFactory {
     function addEth(
         bytes32 _eth2WithdrawalCredentials,
@@ -46,6 +54,27 @@ interface IP2pSsvProxyFactory {
         FeeRecipient calldata _referrerConfig,
         bytes calldata _extraData
     ) external payable returns (bytes32, address, address);
+
+    function registerValidatorsEth(
+        address[] calldata _operatorOwners,
+        uint64[]  calldata _operatorIds,
+        bytes[]   calldata _publicKeys,
+        bytes[]   calldata _sharesData,
+        SsvCluster calldata _cluster,
+        FeeRecipient calldata _clientConfig,
+        FeeRecipient calldata _referrerConfig
+    ) external payable returns (address p2pSsvProxy);
+
+    function registerValidators(
+        address[] calldata _operatorOwners,
+        uint64[]  calldata _operatorIds,
+        bytes[]   calldata _publicKeys,
+        bytes[]   calldata _sharesData,
+        uint256   _amount,
+        SsvCluster calldata _cluster,
+        FeeRecipient calldata _clientConfig,
+        FeeRecipient calldata _referrerConfig
+    ) external payable returns (address p2pSsvProxy);
 
     function getReferenceFeeDistributor() external view returns (address);
     function supportsInterface(bytes4) external view returns (bool);
@@ -219,31 +248,116 @@ contract EthStakingPoliciesTest is Test {
         assertTrue(ok, "addEth on P2pSsvProxyFactory");
     }
 
-    function test_P0_2b_registerValidators_on_factory() public {
-        // Replay real registerValidators tx on old factory (same selector as new)
-        // tx 0x378c2595… · block 23895639 · from 0x5cb5ada4…
-        vm.createSelectFork(_rpc, 23895638);
+    /// Helper: build sorted operator arrays for the new factory.
+    /// Owners must be ascending (factory enforces strict ordering).
+    function _operatorData()
+        internal
+        view
+        returns (
+            address[] memory owners,
+            uint64[]  memory ids,
+            bytes[]   memory pubkeys,
+            bytes[]   memory shares
+        )
+    {
+        // Sorted ascending by owner address
+        owners = new address[](4);
+        owners[0] = 0x47659cc5fB8CDC58bD68fEB8C78A8e19549d39C5;
+        owners[1] = 0x95b3D923060b7E6444d7C3F0FCb01e6F37F4c418;
+        owners[2] = 0x9a792B1588882780Bed412796337E0909e51fAB7;
+        owners[3] = 0xfeC26f2bC35420b4fcA1203EcDf689a6e2310363;
 
-        address sender = 0x5cb5AdA4388454320325347bE70F07602cC3B2d5;
-        vm.deal(sender, 1 ether);
+        // Corresponding operator IDs (from getAllowedSsvOperatorIds)
+        ids = new uint64[](4);
+        ids[0] = 1034;
+        ids[1] = 1033;
+        ids[2] = 1035;
+        ids[3] = 1032;
 
-        bytes memory cd = _loadCalldata("registerValidators.hex");
-        vm.prank(sender);
-        (bool ok,) = SSV_FACTORY_OLD.call{value: 261685080000}(cd);
-        assertTrue(ok, "registerValidators on P2pSsvProxyFactory");
+        // BLS pubkey + encrypted shares from a real registerValidators tx
+        pubkeys = new bytes[](1);
+        pubkeys[0] = vm.parseBytes(vm.readFile("test/data/blsPubkey.hex"));
+
+        shares = new bytes[](1);
+        shares[0] = vm.parseBytes(vm.readFile("test/data/sharesData.hex"));
     }
 
-    function test_P0_2c_registerValidatorsEth_selector() public view {
-        // No mainnet txs exist yet for registerValidatorsEth.
-        // Verify the selector is computable and the new factory is deployed.
-        bytes4 sel = bytes4(keccak256(
-            "registerValidatorsEth(address[],uint64[],bytes[],bytes[],"
-            "(uint32,uint64,uint64,bool,uint256),"
-            "(uint96,address),(uint96,address))"
-        ));
-        assertTrue(sel != bytes4(0), "selector computable");
-        assertTrue(sel != IP2pSsvProxyFactory.addEth.selector, "distinct from addEth");
-        assertTrue(SSV_FACTORY_NEW.code.length > 0, "new factory deployed");
+    /// Revert-reason bytes4 helpers
+    bytes4 constant ERR_NOT_ALLOWED_OP = bytes4(keccak256("P2pSsvProxyFactory__NotAllowedSsvOperatorOwner(address)"));
+    bytes4 constant ERR_NOT_OPERATOR   = bytes4(keccak256("Access__CallerNeitherOperatorNorOwner(address,address,address)"));
+    bytes4 constant ERR_SSV_OP_NOT_ALLOWED = bytes4(keccak256("P2pSsvProxyFactory__SsvOperatorNotAllowed(address,uint64)"));
+    bytes4 constant ERR_DUP_OWNERS     = bytes4(keccak256("P2pSsvProxyFactory__DuplicateOperatorOwnersNotAllowed(address,uint64,uint64)"));
+
+    function _assertNotFactoryACL(bytes memory ret) internal {
+        if (ret.length >= 4) {
+            bytes4 errSel;
+            assembly { errSel := mload(add(ret, 0x20)) }
+            assertTrue(errSel != ERR_NOT_ALLOWED_OP,     "revert must not be NotAllowedSsvOperatorOwner");
+            assertTrue(errSel != ERR_NOT_OPERATOR,        "revert must not be CallerNeitherOperatorNorOwner");
+            assertTrue(errSel != ERR_SSV_OP_NOT_ALLOWED,  "revert must not be SsvOperatorNotAllowed");
+            assertTrue(errSel != ERR_DUP_OWNERS,          "revert must not be DuplicateOperatorOwnersNotAllowed");
+        }
+    }
+
+    function test_P0_2b_registerValidators_on_factory() public {
+        // Call registerValidators(address[],uint64[],bytes[],bytes[],uint256,Cluster,
+        //                         FeeRecipient,FeeRecipient) on the NEW factory.
+        // Uses real operator data (owners + IDs valid on the new factory) and real BLS
+        // pubkey + shares from a historical tx. Amount = 0 (skip SSV token transfer).
+        // Expected: factory ACL & operator validation pass; revert inside SSV Network.
+
+        (address[] memory owners, uint64[] memory ids,
+         bytes[] memory pubkeys, bytes[] memory shares) = _operatorData();
+
+        address caller = owners[3]; // 0xfeC26…, an allowed SSV operator owner
+        vm.deal(caller, 2 ether);
+
+        SsvCluster memory cluster = SsvCluster(0, 0, 0, true, 0);
+        FeeRecipient memory client   = FeeRecipient(9000, payable(caller));
+        FeeRecipient memory referrer = FeeRecipient(0,    payable(address(0)));
+
+        vm.prank(caller);
+        (bool ok, bytes memory ret) = SSV_FACTORY_NEW.call{value: 1 ether}(
+            abi.encodeCall(
+                IP2pSsvProxyFactory.registerValidators,
+                (owners, ids, pubkeys, shares, uint256(0), cluster, client, referrer)
+            )
+        );
+
+        if (!ok) {
+            _assertNotFactoryACL(ret);
+            emit log_named_bytes("registerValidators revert (expected in SSV)", ret);
+        }
+    }
+
+    function test_P0_2c_registerValidatorsEth_on_factory() public {
+        // Call registerValidatorsEth on the NEW factory. Same operator/BLS data.
+        // registerValidatorsEth uses ETH for SSV fees (no `amount` param).
+        // Expected: factory ACL passes; revert inside SSV Network (stale cluster).
+
+        (address[] memory owners, uint64[] memory ids,
+         bytes[] memory pubkeys, bytes[] memory shares) = _operatorData();
+
+        // Caller = factory operator (satisfies onlyOperatorOrOwnerOrClientOrReferrer)
+        address caller = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
+        vm.deal(caller, 2 ether);
+
+        SsvCluster memory cluster = SsvCluster(0, 0, 0, true, 0);
+        FeeRecipient memory client   = FeeRecipient(9000, payable(caller));
+        FeeRecipient memory referrer = FeeRecipient(0,    payable(address(0)));
+
+        vm.prank(caller);
+        (bool ok, bytes memory ret) = SSV_FACTORY_NEW.call{value: 1 ether}(
+            abi.encodeCall(
+                IP2pSsvProxyFactory.registerValidatorsEth,
+                (owners, ids, pubkeys, shares, cluster, client, referrer)
+            )
+        );
+
+        if (!ok) {
+            _assertNotFactoryACL(ret);
+            emit log_named_bytes("registerValidatorsEth revert (expected in SSV)", ret);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
