@@ -7,4 +7,4 @@ evm_version = "cancun"
 fs_permissions = [{ access = "read", path = "test/data" }]
 
 [rpc_endpoints]
-mainnet = "https://mainnet.infura.io/v3/6c80b4478d644647bcc2671e06966b23"
+mainnet = "${MAINNET_RPC_URL}"

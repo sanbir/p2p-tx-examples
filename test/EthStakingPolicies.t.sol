@@ -98,10 +98,7 @@ contract EthStakingPoliciesTest is Test {
     string private _rpc;
 
     function setUp() public {
-        _rpc = vm.envOr(
-            "MAINNET_RPC_URL",
-            string("https://mainnet.infura.io/v3/6c80b4478d644647bcc2671e06966b23")
-        );
+        _rpc = vm.envString("MAINNET_RPC_URL");
         vm.createSelectFork(_rpc, DEFAULT_BLOCK);
     }
 
