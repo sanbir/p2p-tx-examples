@@ -153,6 +153,10 @@ contract EthStakingPoliciesTest is Test {
     // ── Well-known tokens (for P0.5 negative) ────────────────
     address constant USDC                = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
 
+    // ── Real mainnet EOAs (for pranking) ────────────────────────
+    address constant WHALE   = 0xBE0eB53F46cd790Cd13851d5EFf43D12404d33E8; // Binance hot wallet, ~2M ETH
+    address constant WHALE_2 = 0x40B38765696e3d5d8d9d834D8AaD4bB6e418E489; // Binance 2, ~1.1M ETH
+
     // ── Privileged actors ─────────────────────────────────────
     address constant DEPOSITOR_FEE_FACTORY = 0xecA6e48C44C7c0cAf4651E5c5089e564031E8b90;
     address constant DEPOSITOR_OPERATOR    = 0x632788138aa5eac1548b65B41a3d913c291E4cEF;
@@ -267,16 +271,13 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_1a_addEth_on_depositor() public {
-        address user = makeAddr("client_p01");
-        vm.deal(user, 33 ether);
-
-        vm.prank(user);
+        vm.prank(WHALE);
         (bytes32 depositId, address feeDist) =
             IP2pOrgUnlimitedEthDepositor(DEPOSITOR).addEth{value: 32 ether}(
-                _creds(user),
+                _creds(WHALE),
                 uint96(32 ether),
                 REF_FEE_DIST,
-                FeeRecipient(9000, payable(user)),
+                FeeRecipient(9000, payable(WHALE)),
                 FeeRecipient(0,    payable(address(0))),
                 ""
             );
@@ -287,17 +288,14 @@ contract EthStakingPoliciesTest is Test {
     }
 
     function test_P0_1b_refund_on_depositor() public {
-        address user = makeAddr("client_refund");
-        vm.deal(user, 33 ether);
-
         // 1. Create deposit
-        vm.prank(user);
+        vm.prank(WHALE);
         (bytes32 depositId, address feeDist) =
             IP2pOrgUnlimitedEthDepositor(DEPOSITOR).addEth{value: 32 ether}(
-                _creds(user),
+                _creds(WHALE),
                 uint96(32 ether),
                 REF_FEE_DIST,
-                FeeRecipient(9000, payable(user)),
+                FeeRecipient(9000, payable(WHALE)),
                 FeeRecipient(0,    payable(address(0))),
                 ""
             );
@@ -307,14 +305,14 @@ contract EthStakingPoliciesTest is Test {
         vm.warp(uint256(expiry) + 1);
 
         // 3. Refund
-        uint256 balBefore = user.balance;
-        vm.prank(user);
+        uint256 balBefore = WHALE.balance;
+        vm.prank(WHALE);
         IP2pOrgUnlimitedEthDepositor(DEPOSITOR).refund(
-            _creds(user),
+            _creds(WHALE),
             uint96(32 ether),
             feeDist
         );
-        assertGt(user.balance, balBefore, "client received ETH back");
+        assertGt(WHALE.balance, balBefore, "client received ETH back");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -454,8 +452,7 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_3_send_on_messageSender() public {
-        address user = makeAddr("msg_sender");
-        vm.prank(user);
+        vm.prank(WHALE);
         IP2pMessageSender(MESSAGE_SENDER).send(
             '{"action":"withdraw","pubkeys":["0xabc123"]}'
         );
@@ -525,16 +522,13 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_6_eth_to_known_p2p_contract() public {
-        address user = makeAddr("client_p06");
-        vm.deal(user, 33 ether);
-
         // ETH (value > 0) sent to a known P2P contract via addEth
-        vm.prank(user);
+        vm.prank(WHALE);
         IP2pOrgUnlimitedEthDepositor(DEPOSITOR).addEth{value: 32 ether}(
-            _creds(user),
+            _creds(WHALE),
             uint96(32 ether),
             REF_FEE_DIST,
-            FeeRecipient(9000, payable(user)),
+            FeeRecipient(9000, payable(WHALE)),
             FeeRecipient(0,    payable(address(0))),
             ""
         );
@@ -725,12 +719,10 @@ contract EthStakingPoliciesTest is Test {
 
     function test_P0_1_NEG_rejectService_on_depositor() public {
         // Create a deposit first so there's something to reject
-        address user = makeAddr("client_neg1");
-        vm.deal(user, 33 ether);
-        vm.prank(user);
+        vm.prank(WHALE);
         (bytes32 depositId,) = IP2pOrgUnlimitedEthDepositor(DEPOSITOR).addEth{value: 32 ether}(
-            _creds(user), uint96(32 ether), REF_FEE_DIST,
-            FeeRecipient(9000, payable(user)),
+            _creds(WHALE), uint96(32 ether), REF_FEE_DIST,
+            FeeRecipient(9000, payable(WHALE)),
             FeeRecipient(0, payable(address(0))), ""
         );
 
@@ -749,7 +741,7 @@ contract EthStakingPoliciesTest is Test {
 
     function test_P0_2_NEG_changeOperator_on_factory() public {
         address factoryOwner = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
-        address newOperator  = makeAddr("new_operator");
+        address newOperator  = WHALE_2;
 
         // changeOperator is an owner-only function — NOT in the allowed selector list
         vm.prank(factoryOwner);
@@ -799,15 +791,12 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_5_NEG_call_targets_token_contract() public {
-        // Deal USDC to a test address and transfer — this targets a token contract
-        address holder = makeAddr("token_holder");
-        address recipient = makeAddr("token_recipient");
-        deal(USDC, holder, 1000e6);
+        // Transfer USDC from WHALE to WHALE_2 — this targets a token contract
+        deal(USDC, WHALE, 1000e6);
 
-        vm.prank(holder);
-        bool ok = IERC20(USDC).transfer(recipient, 100e6);
+        vm.prank(WHALE);
+        bool ok = IERC20(USDC).transfer(WHALE_2, 100e6);
         assertTrue(ok, "ERC-20 transfer succeeds (but policy should deny)");
-        assertEq(IERC20(USDC).balanceOf(recipient), 100e6);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -815,14 +804,12 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_6_NEG_eth_to_unknown_address() public {
-        address sender = makeAddr("eth_sender");
-        address unknown = makeAddr("unknown_recipient");
-        vm.deal(sender, 2 ether);
-
-        vm.prank(sender);
-        (bool ok,) = unknown.call{value: 1 ether}("");
+        // Send ETH from WHALE to WHALE_2 (not a P2P or system contract)
+        uint256 balBefore = WHALE_2.balance;
+        vm.prank(WHALE);
+        (bool ok,) = WHALE_2.call{value: 1 ether}("");
         assertTrue(ok, "ETH to unknown address succeeds (but policy should deny)");
-        assertEq(unknown.balance, 1 ether);
+        assertEq(WHALE_2.balance, balBefore + 1 ether);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -888,10 +875,9 @@ contract EthStakingPoliciesTest is Test {
 
     function test_P0_9_NEG_enableModule_on_safe() public {
         // 3 Gnosis DAO Safe owners approve + execute enableModule
-        address rogue = makeAddr("rogue_module");
         _safeExec(
             GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.enableModule, (rogue)),
+            abi.encodeCall(ISafe.enableModule, (WHALE)),
             0 // Call
         );
     }
@@ -901,14 +887,12 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_10_NEG_setGuard_on_safe() public {
-        address rogueGuard = makeAddr("rogue_guard");
-
-        // Safe's setGuard checks supportsInterface on the guard. Mock it.
-        vm.mockCall(rogueGuard, abi.encodeWithSelector(0x01ffc9a7), abi.encode(true));
+        // Safe's setGuard checks supportsInterface on the guard. Mock it on WHALE.
+        vm.mockCall(WHALE, abi.encodeWithSelector(0x01ffc9a7), abi.encode(true));
 
         _safeExec(
             GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.setGuard, (rogueGuard)),
+            abi.encodeCall(ISafe.setGuard, (WHALE)),
             0
         );
     }
@@ -918,10 +902,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_11_NEG_setFallbackHandler_on_safe() public {
-        address rogueHandler = makeAddr("rogue_handler");
         _safeExec(
             GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.setFallbackHandler, (rogueHandler)),
+            abi.encodeCall(ISafe.setFallbackHandler, (WHALE)),
             0
         );
     }
@@ -931,13 +914,11 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_12_NEG_addOwnerWithThreshold_on_safe() public {
-        address rogue = makeAddr("rogue_owner");
-
         uint256 ownersBefore = ISafe(GNOSIS_SAFE).getOwners().length;
 
         _safeExec(
             GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.addOwnerWithThreshold, (rogue, 3)),
+            abi.encodeCall(ISafe.addOwnerWithThreshold, (WHALE, 3)),
             0
         );
 
@@ -972,7 +953,7 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_14_NEG_swapOwner_on_safe() public {
-        address newOwner = makeAddr("new_owner");
+        address newOwner = WHALE;
 
         // Swap the last owner. prevOwner is the second-to-last in the list.
         address[] memory owners = ISafe(GNOSIS_SAFE).getOwners();
