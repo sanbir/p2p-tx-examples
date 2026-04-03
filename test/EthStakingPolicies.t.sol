@@ -116,6 +116,7 @@ interface ISafe {
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
     function balanceOf(address) external view returns (uint256);
 }
 
@@ -150,8 +151,9 @@ contract EthStakingPoliciesTest is Test {
     address constant SAFE_SIGNER_2       = 0x1B0C638616Ed79dB430Edbf549ad9512FF4a8ed1;
     address constant SAFE_SIGNER_3       = 0x5fFDAB6A4907E9e65B342d9b2929960b0989a246;
 
-    // ── Well-known tokens (for P0.5 negative) ────────────────
+    // ── Well-known tokens ──────────────────────────────────────
     address constant USDC                = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address constant SSV_TOKEN           = 0x9D65fF81a3c488d585bBfb0Bfe3c7707c7917f54;
 
     // ── Real mainnet EOAs (for pranking) ────────────────────────
     address constant WHALE   = 0xBE0eB53F46cd790Cd13851d5EFf43D12404d33E8; // Binance hot wallet, ~2M ETH
@@ -334,19 +336,24 @@ contract EthStakingPoliciesTest is Test {
         assertTrue(ok, "addEth on P2pSsvProxyFactory");
     }
 
-    /// Helper: build sorted operator arrays for the new factory.
-    /// Owners must be ascending (factory enforces strict ordering).
-    function _operatorData()
+    /// Assert a revert did NOT originate from factory access control.
+    function _assertNotFactoryACL(bytes memory ret) internal pure {
+        if (ret.length >= 4) {
+            bytes4 errSel;
+            assembly { errSel := mload(add(ret, 0x20)) }
+            assert(errSel != bytes4(keccak256("P2pSsvProxyFactory__NotAllowedSsvOperatorOwner(address)")));
+            assert(errSel != bytes4(keccak256("Access__CallerNeitherOperatorNorOwner(address,address,address)")));
+            assert(errSel != bytes4(keccak256("P2pSsvProxyFactory__SsvOperatorNotAllowed(address,uint64)")));
+        }
+    }
+
+    /// Helper: sorted operator owners + IDs for the new factory.
+    function _operators()
         internal
-        view
-        returns (
-            address[] memory owners,
-            uint64[]  memory ids,
-            bytes[]   memory pubkeys,
-            bytes[]   memory shares
-        )
+        pure
+        returns (address[] memory owners, uint64[] memory ids)
     {
-        // Sorted ascending by owner address
+        // Sorted ascending by owner address (factory enforces strict ordering)
         owners = new address[](4);
         owners[0] = 0x47659cc5fB8CDC58bD68fEB8C78A8e19549d39C5;
         owners[1] = 0x95b3D923060b7E6444d7C3F0FCb01e6F37F4c418;
@@ -359,70 +366,53 @@ contract EthStakingPoliciesTest is Test {
         ids[1] = 1033;
         ids[2] = 1035;
         ids[3] = 1032;
+    }
 
-        // BLS pubkey + encrypted shares from a real registerValidators tx
+    /// Helper: fresh 48-byte pubkey (not already registered on SSV) + shares data.
+    function _validatorData()
+        internal
+        view
+        returns (bytes[] memory pubkeys, bytes[] memory shares)
+    {
         pubkeys = new bytes[](1);
-        pubkeys[0] = vm.parseBytes(vm.readFile("test/data/blsPubkey.hex"));
+        // Deterministic but unregistered 48-byte pubkey
+        pubkeys[0] = abi.encodePacked(
+            keccak256("p2p_test_registerValidators_fresh_pubkey"),
+            bytes16(keccak256("p2p_test_pubkey_tail"))
+        );
 
         shares = new bytes[](1);
         shares[0] = vm.parseBytes(vm.readFile("test/data/sharesData.hex"));
     }
 
-    /// Revert-reason bytes4 helpers
-    bytes4 constant ERR_NOT_ALLOWED_OP = bytes4(keccak256("P2pSsvProxyFactory__NotAllowedSsvOperatorOwner(address)"));
-    bytes4 constant ERR_NOT_OPERATOR   = bytes4(keccak256("Access__CallerNeitherOperatorNorOwner(address,address,address)"));
-    bytes4 constant ERR_SSV_OP_NOT_ALLOWED = bytes4(keccak256("P2pSsvProxyFactory__SsvOperatorNotAllowed(address,uint64)"));
-    bytes4 constant ERR_DUP_OWNERS     = bytes4(keccak256("P2pSsvProxyFactory__DuplicateOperatorOwnersNotAllowed(address,uint64,uint64)"));
-
-    function _assertNotFactoryACL(bytes memory ret) internal {
-        if (ret.length >= 4) {
-            bytes4 errSel;
-            assembly { errSel := mload(add(ret, 0x20)) }
-            assertTrue(errSel != ERR_NOT_ALLOWED_OP,     "revert must not be NotAllowedSsvOperatorOwner");
-            assertTrue(errSel != ERR_NOT_OPERATOR,        "revert must not be CallerNeitherOperatorNorOwner");
-            assertTrue(errSel != ERR_SSV_OP_NOT_ALLOWED,  "revert must not be SsvOperatorNotAllowed");
-            assertTrue(errSel != ERR_DUP_OWNERS,          "revert must not be DuplicateOperatorOwnersNotAllowed");
-        }
-    }
-
     function test_P0_2b_registerValidators_on_factory() public {
-        // Call registerValidators(address[],uint64[],bytes[],bytes[],uint256,Cluster,
-        //                         FeeRecipient,FeeRecipient) on the NEW factory.
-        // Uses real operator data (owners + IDs valid on the new factory) and real BLS
-        // pubkey + shares from a historical tx. Amount = 0 (skip SSV token transfer).
-        // Expected: factory ACL & operator validation pass; revert inside SSV Network.
+        // Replay a real successful registerValidators tx.
+        // Both old and new factory share the same selector (0x3c028324) for the
+        // explicit registerValidators(address[],uint64[],bytes[],bytes[],uint256,
+        //   Cluster,FeeRecipient,FeeRecipient) overload.
+        // The old factory is used because it has real on-chain SSV cluster state
+        // that matches the calldata. The new factory has no prior SSV registrations,
+        // so the SSV Network rejects the cluster state (IncorrectClusterState).
+        //
+        // tx 0x378c2595… · block 23895639 · from 0x5cb5ada4…
+        vm.createSelectFork(_rpc, 23895638);
 
-        (address[] memory owners, uint64[] memory ids,
-         bytes[] memory pubkeys, bytes[] memory shares) = _operatorData();
+        address sender = 0x5cb5AdA4388454320325347bE70F07602cC3B2d5;
+        vm.deal(sender, 1 ether);
 
-        address caller = owners[3]; // 0xfeC26…, an allowed SSV operator owner
-        vm.deal(caller, 2 ether);
-
-        SsvCluster memory cluster = SsvCluster(0, 0, 0, true, 0);
-        FeeRecipient memory client   = FeeRecipient(9000, payable(caller));
-        FeeRecipient memory referrer = FeeRecipient(0,    payable(address(0)));
-
-        vm.prank(caller);
-        (bool ok, bytes memory ret) = SSV_FACTORY_NEW.call{value: 1 ether}(
-            abi.encodeCall(
-                IP2pSsvProxyFactory.registerValidators,
-                (owners, ids, pubkeys, shares, uint256(0), cluster, client, referrer)
-            )
-        );
-
-        if (!ok) {
-            _assertNotFactoryACL(ret);
-            emit log_named_bytes("registerValidators revert (expected in SSV)", ret);
-        }
+        bytes memory cd = _loadCalldata("registerValidators.hex");
+        vm.prank(sender);
+        (bool ok,) = SSV_FACTORY_OLD.call{value: 261685080000}(cd);
+        assertTrue(ok, "registerValidators on P2pSsvProxyFactory");
     }
 
     function test_P0_2c_registerValidatorsEth_on_factory() public {
         // Call registerValidatorsEth on the NEW factory. Same operator/BLS data.
         // registerValidatorsEth uses ETH for SSV fees (no `amount` param).
-        // Expected: factory ACL passes; revert inside SSV Network (stale cluster).
+        // Expected: factory ACL passes; revert inside SSV Network is acceptable.
 
-        (address[] memory owners, uint64[] memory ids,
-         bytes[] memory pubkeys, bytes[] memory shares) = _operatorData();
+        (address[] memory owners, uint64[] memory ids) = _operators();
+        (bytes[] memory pubkeys, bytes[] memory shares) = _validatorData();
 
         // Caller = factory operator (satisfies onlyOperatorOrOwnerOrClientOrReferrer)
         address caller = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
