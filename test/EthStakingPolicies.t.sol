@@ -503,28 +503,25 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_7_multisend_no_delegatecall() public {
-        bytes memory op1 = abi.encodeCall(IP2pMessageSender.send, ("p07-op1"));
-        bytes memory op2 = abi.encodeCall(IP2pMessageSender.send, ("p07-op2"));
-        bytes memory op3 = abi.encodeCall(IP2pMessageSender.send, ("p07-op3"));
-
+        // Safe executes a multiSend (DelegateCall to MultiSend singleton)
+        // where every sub-operation uses operation=0 (Call), not delegatecall.
         bytes memory txs = abi.encodePacked(
-            _packOp(0, MESSAGE_SENDER, 0, op1),
-            _packOp(0, MESSAGE_SENDER, 0, op2),
-            _packOp(0, MESSAGE_SENDER, 0, op3)
+            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op1"))),
+            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op2"))),
+            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op3")))
         );
 
-        // Parse and verify every sub-op has operation = 0 (Call)
+        // Verify every sub-op has operation = 0 (Call)
         uint256 i;
         while (i < txs.length) {
-            uint8 op = uint8(txs[i]);
-            assertEq(op, 0, "all ops must be Call(0), not DelegateCall(1)");
+            assertEq(uint8(txs[i]), 0, "all ops must be Call(0), not DelegateCall(1)");
             uint256 dataLen;
             assembly { dataLen := mload(add(add(txs, 0x20), add(i, 53))) }
             i += 85 + dataLen;
         }
 
-        // Execute via MultiSendCallOnly (Safe v1.4.1 / v1.3.0)
-        IMultiSend(_multiSend()).multiSend(txs);
+        // Execute through the real Gnosis DAO Safe (DelegateCall to MultiSend)
+        _safeExec(MULTISEND_FULL, 0, abi.encodeCall(IMultiSend.multiSend, (txs)), 1);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -532,20 +529,17 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_8_multisend_max_10_ops() public {
+        // Safe executes a multiSend with 5 sub-operations (≤10 limit)
         bytes memory txs;
         uint256 opCount;
-
         for (uint256 j; j < 5; j++) {
-            bytes memory data = abi.encodeCall(
-                IP2pMessageSender.send,
-                (string(abi.encodePacked("p08-op", bytes1(uint8(0x30 + j)))))
-            );
-            txs = abi.encodePacked(txs, _packOp(0, MESSAGE_SENDER, 0, data));
+            txs = abi.encodePacked(txs, _packOp(0, MESSAGE_SENDER, 0,
+                abi.encodeCall(IP2pMessageSender.send,
+                    (string(abi.encodePacked("p08-op", bytes1(uint8(0x30 + j))))))));
             opCount++;
         }
-
         assertTrue(opCount <= 10, "at most 10 sub-operations");
-        IMultiSend(_multiSend()).multiSend(txs);
+        _safeExec(MULTISEND_FULL, 0, abi.encodeCall(IMultiSend.multiSend, (txs)), 1);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -553,17 +547,11 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_9_no_enableModule_disableModule() public {
-        // Verify allowed selectors don't collide with forbidden ones
-        bytes4 addEthSel = IP2pOrgUnlimitedEthDepositor.addEth.selector;
-        bytes4 refundSel = IP2pOrgUnlimitedEthDepositor.refund.selector;
-        bytes4 sendSel   = IP2pMessageSender.send.selector;
-
-        assertTrue(addEthSel != SEL_ENABLE_MODULE  && addEthSel != SEL_DISABLE_MODULE);
-        assertTrue(refundSel != SEL_ENABLE_MODULE  && refundSel != SEL_DISABLE_MODULE);
-        assertTrue(sendSel   != SEL_ENABLE_MODULE  && sendSel   != SEL_DISABLE_MODULE);
-
-        // Execute a valid call
-        IP2pMessageSender(MESSAGE_SENDER).send("p09-test");
+        // Safe calls P2pMessageSender.send (allowed) — selector ≠ enableModule/disableModule
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p09-test"));
+        bytes4 sel = bytes4(data);
+        assertTrue(sel != SEL_ENABLE_MODULE && sel != SEL_DISABLE_MODULE);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -571,9 +559,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_10_no_setGuard() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_SET_GUARD);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_SET_GUARD);
-        IP2pMessageSender(MESSAGE_SENDER).send("p10-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p10-test"));
+        assertTrue(bytes4(data) != SEL_SET_GUARD);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -581,9 +569,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_11_no_setFallbackHandler() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_SET_FALLBACK);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_SET_FALLBACK);
-        IP2pMessageSender(MESSAGE_SENDER).send("p11-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p11-test"));
+        assertTrue(bytes4(data) != SEL_SET_FALLBACK);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -591,9 +579,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_12_no_addOwnerWithThreshold() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_ADD_OWNER);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_ADD_OWNER);
-        IP2pMessageSender(MESSAGE_SENDER).send("p12-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p12-test"));
+        assertTrue(bytes4(data) != SEL_ADD_OWNER);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -601,9 +589,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_13_no_removeOwner() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_REMOVE_OWNER);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_REMOVE_OWNER);
-        IP2pMessageSender(MESSAGE_SENDER).send("p13-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p13-test"));
+        assertTrue(bytes4(data) != SEL_REMOVE_OWNER);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -611,9 +599,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_14_no_swapOwner() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_SWAP_OWNER);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_SWAP_OWNER);
-        IP2pMessageSender(MESSAGE_SENDER).send("p14-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p14-test"));
+        assertTrue(bytes4(data) != SEL_SWAP_OWNER);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -621,9 +609,9 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_15_no_changeThreshold() public {
-        assertTrue(IP2pOrgUnlimitedEthDepositor.addEth.selector != SEL_CHANGE_THRESHOLD);
-        assertTrue(IP2pMessageSender.send.selector              != SEL_CHANGE_THRESHOLD);
-        IP2pMessageSender(MESSAGE_SENDER).send("p15-test");
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p15-test"));
+        assertTrue(bytes4(data) != SEL_CHANGE_THRESHOLD);
+        _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -663,8 +651,8 @@ contract EthStakingPoliciesTest is Test {
 
         assertTrue(count <= 10, "P0.8: at most 10 ops");
 
-        // Execute
-        IMultiSend(_multiSend()).multiSend(txs);
+        // Execute through the real Gnosis DAO Safe
+        _safeExec(MULTISEND_FULL, 0, abi.encodeCall(IMultiSend.multiSend, (txs)), 1);
     }
 
     // ╔═══════════════════════════════════════════════════════════╗
