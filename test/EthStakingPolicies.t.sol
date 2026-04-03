@@ -144,12 +144,12 @@ contract EthStakingPoliciesTest is Test {
     address constant MULTISEND_V130      = 0x40A2aCCbd92BCA938b02010E17A5b8929b49130D;
     address constant MULTISEND_FULL      = 0x38869BF66A61CF6BDDB996A6AE40d5853fd43b52;
 
-    // ── Real mainnet Safe: Gnosis DAO (3/11 multisig, ~3.2 ETH) ──
-    address constant GNOSIS_SAFE         = 0x849D52316331967b6fF1198e5E32A0eB168D039d;
-    // First 3 owners in ascending address order (needed for sorted signatures)
-    address constant SAFE_SIGNER_1       = 0x0DA0C3e52C977Ed3cBc641fF02DD271c3ED55aFe;
-    address constant SAFE_SIGNER_2       = 0x1B0C638616Ed79dB430Edbf549ad9512FF4a8ed1;
-    address constant SAFE_SIGNER_3       = 0x5fFDAB6A4907E9e65B342d9b2929960b0989a246;
+    // ── Real mainnet Safe: ENS DAO (1/1 multisig, ~6.7 ETH) ────
+    address constant SAFE_ADDR           = 0x4F2083f5fBede34C2714aFfb3105539775f7FE64;
+    address constant SAFE_ORIGINAL_OWNER = 0xFe89cc7aBB2C4183683ab71653C4cdc9B02D44b7;
+    // Foundry default account #0 — known private key for vm.sign
+    uint256 constant SIGNER_PK  = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
+    address constant SIGNER     = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
 
     // ── Well-known tokens ──────────────────────────────────────
     address constant USDC                = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
@@ -215,42 +215,51 @@ contract EthStakingPoliciesTest is Test {
         return vm.parseBytes(hexStr);
     }
 
-    /// Execute an arbitrary tx through the Gnosis DAO Safe (3/11 multisig).
-    /// Pranks 3 real EOA owners to approveHash, then executes from signer 1.
+    /// Swap the ENS Safe's owner to SIGNER (Foundry default account #0)
+    /// via direct storage writes. Called once, idempotent.
+    bool private _ownerSwapped;
+    function _installSigner() internal {
+        if (_ownerSwapped) return;
+        _ownerSwapped = true;
+        address safe = SAFE_ADDR;
+        // Safe v1.4.1 storage: owners mapping at slot 2 (linked list)
+        // sentinel(0x1) → owner → sentinel(0x1)
+        bytes32 slotSentinel   = keccak256(abi.encode(address(0x1), uint256(2)));
+        bytes32 slotOldOwner   = keccak256(abi.encode(SAFE_ORIGINAL_OWNER, uint256(2)));
+        bytes32 slotNewOwner   = keccak256(abi.encode(SIGNER, uint256(2)));
+
+        vm.store(safe, slotSentinel, bytes32(uint256(uint160(SIGNER))));
+        vm.store(safe, slotNewOwner, bytes32(uint256(uint160(address(0x1)))));
+        vm.store(safe, slotOldOwner, bytes32(0));
+
+        // Verify
+        assertEq(ISafe(safe).getOwners()[0], SIGNER, "owner swapped to SIGNER");
+    }
+
+    /// Execute an arbitrary tx through the ENS Safe (1/1, threshold=1).
+    /// Uses vm.sign with SIGNER_PK — no approveHash needed.
     function _safeExec(
         address to,
         uint256 value,
         bytes memory data,
         uint8 operation  // 0 = Call, 1 = DelegateCall
     ) internal {
-        ISafe safe = ISafe(GNOSIS_SAFE);
-        uint256 n = safe.nonce();
+        _installSigner();
+        ISafe safe = ISafe(SAFE_ADDR);
 
         bytes32 txHash = safe.getTransactionHash(
             to, value, data, operation,
-            0, 0, 0, address(0), address(0), n
+            0, 0, 0, address(0), address(0), safe.nonce()
         );
 
-        // 3 owners approve the hash (each pranked as real EOA)
-        vm.prank(SAFE_SIGNER_1, SAFE_SIGNER_1);
-        safe.approveHash(txHash);
-        vm.prank(SAFE_SIGNER_2, SAFE_SIGNER_2);
-        safe.approveHash(txHash);
-        vm.prank(SAFE_SIGNER_3, SAFE_SIGNER_3);
-        safe.approveHash(txHash);
+        // ECDSA signature with the known private key — no approveHash
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, txHash);
+        bytes memory sig = abi.encodePacked(r, s, v);
 
-        // Build pre-approved signatures — must be sorted ascending by signer address
-        bytes memory sigs = abi.encodePacked(
-            bytes32(uint256(uint160(SAFE_SIGNER_1))), bytes32(0), uint8(1),
-            bytes32(uint256(uint160(SAFE_SIGNER_2))), bytes32(0), uint8(1),
-            bytes32(uint256(uint160(SAFE_SIGNER_3))), bytes32(0), uint8(1)
-        );
-
-        // Execute from signer 1 (real EOA as both msg.sender and tx.origin)
-        vm.prank(SAFE_SIGNER_1, SAFE_SIGNER_1);
+        vm.prank(SIGNER, SIGNER);
         bool ok = safe.execTransaction(
             to, value, data, operation,
-            0, 0, 0, address(0), payable(address(0)), sigs
+            0, 0, 0, address(0), payable(address(0)), sig
         );
         assertTrue(ok, "Safe execTransaction must succeed");
     }
@@ -824,7 +833,7 @@ contract EthStakingPoliciesTest is Test {
     function test_P0_9_NEG_enableModule_on_safe() public {
         // 3 Gnosis DAO Safe owners approve + execute enableModule
         _safeExec(
-            GNOSIS_SAFE, 0,
+            SAFE_ADDR, 0,
             abi.encodeCall(ISafe.enableModule, (WHALE)),
             0 // Call
         );
@@ -839,7 +848,7 @@ contract EthStakingPoliciesTest is Test {
         vm.mockCall(WHALE, abi.encodeWithSelector(0x01ffc9a7), abi.encode(true));
 
         _safeExec(
-            GNOSIS_SAFE, 0,
+            SAFE_ADDR, 0,
             abi.encodeCall(ISafe.setGuard, (WHALE)),
             0
         );
@@ -851,7 +860,7 @@ contract EthStakingPoliciesTest is Test {
 
     function test_P0_11_NEG_setFallbackHandler_on_safe() public {
         _safeExec(
-            GNOSIS_SAFE, 0,
+            SAFE_ADDR, 0,
             abi.encodeCall(ISafe.setFallbackHandler, (WHALE)),
             0
         );
@@ -862,15 +871,13 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_12_NEG_addOwnerWithThreshold_on_safe() public {
-        uint256 ownersBefore = ISafe(GNOSIS_SAFE).getOwners().length;
-
+        // ENS Safe has 1 owner (SIGNER). Add WHALE as 2nd owner, threshold stays 1.
         _safeExec(
-            GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.addOwnerWithThreshold, (WHALE, 3)),
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.addOwnerWithThreshold, (WHALE, 1)),
             0
         );
-
-        assertEq(ISafe(GNOSIS_SAFE).getOwners().length, ownersBefore + 1, "owner added");
+        assertEq(ISafe(SAFE_ADDR).getOwners().length, 2, "owner added");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -878,22 +885,22 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_13_NEG_removeOwner_on_safe() public {
-        // Remove the last owner in the linked list.
-        // Gnosis Safe owners (sorted by linked list, NOT by address):
-        //   sentinel -> owner[0] -> owner[1] -> ... -> owner[10] -> sentinel
-        // getOwners() returns them in linked-list order.
-        address[] memory owners = ISafe(GNOSIS_SAFE).getOwners();
-        // Remove the last listed owner; its prevOwner is owners[length-2]
-        address toRemove = owners[owners.length - 1];
-        address prevOwner = owners[owners.length - 2];
-
+        // First add a 2nd owner so we can remove one (can't remove the only owner)
         _safeExec(
-            GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.removeOwner, (prevOwner, toRemove, 3)),
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.addOwnerWithThreshold, (WHALE, 1)),
             0
         );
+        assertEq(ISafe(SAFE_ADDR).getOwners().length, 2);
 
-        assertEq(ISafe(GNOSIS_SAFE).getOwners().length, owners.length - 1, "owner removed");
+        // Remove WHALE. In linked list: sentinel → WHALE → SIGNER → sentinel
+        // (addOwner prepends). prevOwner for WHALE = sentinel(0x1).
+        _safeExec(
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.removeOwner, (address(0x1), WHALE, 1)),
+            0
+        );
+        assertEq(ISafe(SAFE_ADDR).getOwners().length, 1, "owner removed");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -901,23 +908,14 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_14_NEG_swapOwner_on_safe() public {
-        address newOwner = WHALE;
-
-        // Swap the last owner. prevOwner is the second-to-last in the list.
-        address[] memory owners = ISafe(GNOSIS_SAFE).getOwners();
-        address oldOwner = owners[owners.length - 1];
-        address prevOwner = owners[owners.length - 2];
-
+        // Swap SIGNER → WHALE. Linked list: sentinel → SIGNER → sentinel.
+        // prevOwner for SIGNER = sentinel(0x1).
         _safeExec(
-            GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.swapOwner, (prevOwner, oldOwner, newOwner)),
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.swapOwner, (address(0x1), SIGNER, WHALE)),
             0
         );
-
-        // Verify swap
-        address[] memory after_ = ISafe(GNOSIS_SAFE).getOwners();
-        assertEq(after_.length, owners.length, "same count");
-        assertEq(after_[after_.length - 1], newOwner, "owner was swapped");
+        assertEq(ISafe(SAFE_ADDR).getOwners()[0], WHALE, "owner swapped");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -925,14 +923,19 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_15_NEG_changeThreshold_on_safe() public {
-        assertEq(ISafe(GNOSIS_SAFE).getThreshold(), 3);
-
+        // Add 2nd owner first (threshold can't exceed owner count)
         _safeExec(
-            GNOSIS_SAFE, 0,
-            abi.encodeCall(ISafe.changeThreshold, (4)),
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.addOwnerWithThreshold, (WHALE, 1)),
             0
         );
 
-        assertEq(ISafe(GNOSIS_SAFE).getThreshold(), 4, "threshold changed");
+        // Now change threshold from 1 → 2
+        _safeExec(
+            SAFE_ADDR, 0,
+            abi.encodeCall(ISafe.changeThreshold, (2)),
+            0
+        );
+        assertEq(ISafe(SAFE_ADDR).getThreshold(), 2, "threshold changed");
     }
 }
