@@ -88,25 +88,7 @@ interface IMultiSend {
     function multiSend(bytes memory transactions) external payable;
 }
 
-interface ISafeProxyFactory {
-    function createProxyWithNonce(
-        address singleton,
-        bytes memory initializer,
-        uint256 saltNonce
-    ) external returns (address proxy);
-}
-
 interface ISafe {
-    function setup(
-        address[] calldata _owners,
-        uint256 _threshold,
-        address to,
-        bytes calldata data,
-        address fallbackHandler,
-        address paymentToken,
-        uint256 payment,
-        address payable paymentReceiver
-    ) external;
     function enableModule(address module) external;
     function disableModule(address prevModule, address module) external;
     function setGuard(address guard) external;
@@ -118,6 +100,12 @@ interface ISafe {
     function getOwners() external view returns (address[] memory);
     function getThreshold() external view returns (uint256);
     function nonce() external view returns (uint256);
+    function approveHash(bytes32 hashToApprove) external;
+    function getTransactionHash(
+        address to, uint256 value, bytes calldata data, uint8 operation,
+        uint256 safeTxGas, uint256 baseGas, uint256 gasPrice,
+        address gasToken, address refundReceiver, uint256 _nonce
+    ) external view returns (bytes32);
     function execTransaction(
         address to, uint256 value, bytes calldata data,
         uint8 operation, uint256 safeTxGas, uint256 baseGas,
@@ -129,14 +117,6 @@ interface ISafe {
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address) external view returns (uint256);
-}
-
-/// @dev Helper that delegatecalls to MultiSend (needed for P0.7 negative test)
-contract DelegateCaller {
-    function exec(address target, bytes memory data) external payable {
-        (bool ok,) = target.delegatecall(data);
-        require(ok, "delegatecall failed");
-    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -162,8 +142,13 @@ contract EthStakingPoliciesTest is Test {
     address constant MULTISEND_V141      = 0x9641d764fc13c8B624c04430C7356C1C7C8102e2;
     address constant MULTISEND_V130      = 0x40A2aCCbd92BCA938b02010E17A5b8929b49130D;
     address constant MULTISEND_FULL      = 0x38869BF66A61CF6BDDB996A6AE40d5853fd43b52;
-    address constant SAFE_SINGLETON      = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
-    address constant SAFE_PROXY_FACTORY  = 0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67;
+
+    // ── Real mainnet Safe: Gnosis DAO (3/11 multisig, ~3.2 ETH) ──
+    address constant GNOSIS_SAFE         = 0x849D52316331967b6fF1198e5E32A0eB168D039d;
+    // First 3 owners in ascending address order (needed for sorted signatures)
+    address constant SAFE_SIGNER_1       = 0x0DA0C3e52C977Ed3cBc641fF02DD271c3ED55aFe;
+    address constant SAFE_SIGNER_2       = 0x1B0C638616Ed79dB430Edbf549ad9512FF4a8ed1;
+    address constant SAFE_SIGNER_3       = 0x5fFDAB6A4907E9e65B342d9b2929960b0989a246;
 
     // ── Well-known tokens (for P0.5 negative) ────────────────
     address constant USDC                = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
@@ -224,17 +209,44 @@ contract EthStakingPoliciesTest is Test {
         return vm.parseBytes(hexStr);
     }
 
-    /// Deploy a fresh Safe v1.4.1 proxy with `owner` as sole owner (threshold=1).
-    function _deploySafe(address owner) internal returns (address safe) {
-        address[] memory owners = new address[](1);
-        owners[0] = owner;
-        bytes memory init = abi.encodeCall(
-            ISafe.setup,
-            (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
+    /// Execute an arbitrary tx through the Gnosis DAO Safe (3/11 multisig).
+    /// Pranks 3 real EOA owners to approveHash, then executes from signer 1.
+    function _safeExec(
+        address to,
+        uint256 value,
+        bytes memory data,
+        uint8 operation  // 0 = Call, 1 = DelegateCall
+    ) internal {
+        ISafe safe = ISafe(GNOSIS_SAFE);
+        uint256 n = safe.nonce();
+
+        bytes32 txHash = safe.getTransactionHash(
+            to, value, data, operation,
+            0, 0, 0, address(0), address(0), n
         );
-        safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
-            SAFE_SINGLETON, init, block.timestamp
+
+        // 3 owners approve the hash (each pranked as real EOA)
+        vm.prank(SAFE_SIGNER_1, SAFE_SIGNER_1);
+        safe.approveHash(txHash);
+        vm.prank(SAFE_SIGNER_2, SAFE_SIGNER_2);
+        safe.approveHash(txHash);
+        vm.prank(SAFE_SIGNER_3, SAFE_SIGNER_3);
+        safe.approveHash(txHash);
+
+        // Build pre-approved signatures — must be sorted ascending by signer address
+        bytes memory sigs = abi.encodePacked(
+            bytes32(uint256(uint160(SAFE_SIGNER_1))), bytes32(0), uint8(1),
+            bytes32(uint256(uint160(SAFE_SIGNER_2))), bytes32(0), uint8(1),
+            bytes32(uint256(uint160(SAFE_SIGNER_3))), bytes32(0), uint8(1)
         );
+
+        // Execute from signer 1 (real EOA as both msg.sender and tx.origin)
+        vm.prank(SAFE_SIGNER_1, SAFE_SIGNER_1);
+        bool ok = safe.execTransaction(
+            to, value, data, operation,
+            0, 0, 0, address(0), payable(address(0)), sigs
+        );
+        assertTrue(ok, "Safe execTransaction must succeed");
     }
 
     /// Assert that `sel` is not any of the P0.9–P0.15 forbidden selectors.
@@ -836,9 +848,14 @@ contract EthStakingPoliciesTest is Test {
         }
         assertTrue(hasDelegatecall, "payload contains delegatecall op");
 
-        // Execute via a helper that delegatecalls to MultiSend (like a Safe would)
-        DelegateCaller caller = new DelegateCaller();
-        caller.exec(MULTISEND_FULL, abi.encodeCall(IMultiSend.multiSend, (txs)));
+        // Execute through the real Gnosis DAO Safe via DelegateCall to MultiSend
+        // (this is how a Safe batches calls — it delegatecalls the MultiSend singleton)
+        _safeExec(
+            MULTISEND_FULL,
+            0,
+            abi.encodeCall(IMultiSend.multiSend, (txs)),
+            1 // DelegateCall
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -870,12 +887,13 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_9_NEG_enableModule_on_safe() public {
-        address safe = _deploySafe(address(this));
+        // 3 Gnosis DAO Safe owners approve + execute enableModule
         address rogue = makeAddr("rogue_module");
-
-        // enableModule is authorized (msg.sender == self). Prank as the Safe.
-        vm.prank(safe);
-        ISafe(safe).enableModule(rogue);
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.enableModule, (rogue)),
+            0 // Call
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -883,19 +901,16 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_10_NEG_setGuard_on_safe() public {
-        address safe = _deploySafe(address(this));
         address rogueGuard = makeAddr("rogue_guard");
 
-        // Safe's setGuard checks supportsInterface(Guard.interfaceId) on the guard.
-        // Mock the ERC165 response so the call succeeds.
-        vm.mockCall(
-            rogueGuard,
-            abi.encodeWithSelector(0x01ffc9a7), // supportsInterface(bytes4)
-            abi.encode(true)
-        );
+        // Safe's setGuard checks supportsInterface on the guard. Mock it.
+        vm.mockCall(rogueGuard, abi.encodeWithSelector(0x01ffc9a7), abi.encode(true));
 
-        vm.prank(safe);
-        ISafe(safe).setGuard(rogueGuard);
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.setGuard, (rogueGuard)),
+            0
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -903,11 +918,12 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_11_NEG_setFallbackHandler_on_safe() public {
-        address safe = _deploySafe(address(this));
         address rogueHandler = makeAddr("rogue_handler");
-
-        vm.prank(safe);
-        ISafe(safe).setFallbackHandler(rogueHandler);
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.setFallbackHandler, (rogueHandler)),
+            0
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -915,15 +931,17 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_12_NEG_addOwnerWithThreshold_on_safe() public {
-        address safe = _deploySafe(address(this));
         address rogue = makeAddr("rogue_owner");
 
-        vm.prank(safe);
-        ISafe(safe).addOwnerWithThreshold(rogue, 1);
+        uint256 ownersBefore = ISafe(GNOSIS_SAFE).getOwners().length;
 
-        // Verify the owner was added
-        address[] memory owners = ISafe(safe).getOwners();
-        assertEq(owners.length, 2, "Safe now has 2 owners");
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.addOwnerWithThreshold, (rogue, 3)),
+            0
+        );
+
+        assertEq(ISafe(GNOSIS_SAFE).getOwners().length, ownersBefore + 1, "owner added");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -931,31 +949,22 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_13_NEG_removeOwner_on_safe() public {
-        address owner1 = makeAddr("owner1");
-        address owner2 = makeAddr("owner2");
+        // Remove the last owner in the linked list.
+        // Gnosis Safe owners (sorted by linked list, NOT by address):
+        //   sentinel -> owner[0] -> owner[1] -> ... -> owner[10] -> sentinel
+        // getOwners() returns them in linked-list order.
+        address[] memory owners = ISafe(GNOSIS_SAFE).getOwners();
+        // Remove the last listed owner; its prevOwner is owners[length-2]
+        address toRemove = owners[owners.length - 1];
+        address prevOwner = owners[owners.length - 2];
 
-        // Deploy Safe with 2 owners (need 2 so we can remove one)
-        address safe;
-        {
-            address[] memory owners = new address[](2);
-            owners[0] = owner1;
-            owners[1] = owner2;
-            bytes memory init = abi.encodeCall(
-                ISafe.setup,
-                (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
-            );
-            safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
-                SAFE_SINGLETON, init, block.timestamp + 1
-            );
-        }
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.removeOwner, (prevOwner, toRemove, 3)),
+            0
+        );
 
-        // removeOwner(prevOwner, owner, newThreshold)
-        // In Safe's linked list, sentinel (0x1) -> owner1 -> owner2 -> sentinel
-        // To remove owner2: prevOwner = owner1
-        vm.prank(safe);
-        ISafe(safe).removeOwner(owner1, owner2, 1);
-
-        assertEq(ISafe(safe).getOwners().length, 1, "Safe now has 1 owner");
+        assertEq(ISafe(GNOSIS_SAFE).getOwners().length, owners.length - 1, "owner removed");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -963,18 +972,23 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_14_NEG_swapOwner_on_safe() public {
-        address originalOwner = address(this);
-        address safe = _deploySafe(originalOwner);
         address newOwner = makeAddr("new_owner");
 
-        // swapOwner(prevOwner, oldOwner, newOwner)
-        // Linked list: sentinel (0x1) -> originalOwner -> sentinel
-        // prevOwner for the only owner is the sentinel = address(0x1)
-        vm.prank(safe);
-        ISafe(safe).swapOwner(address(0x1), originalOwner, newOwner);
+        // Swap the last owner. prevOwner is the second-to-last in the list.
+        address[] memory owners = ISafe(GNOSIS_SAFE).getOwners();
+        address oldOwner = owners[owners.length - 1];
+        address prevOwner = owners[owners.length - 2];
 
-        address[] memory owners = ISafe(safe).getOwners();
-        assertEq(owners[0], newOwner, "owner was swapped");
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.swapOwner, (prevOwner, oldOwner, newOwner)),
+            0
+        );
+
+        // Verify swap
+        address[] memory after_ = ISafe(GNOSIS_SAFE).getOwners();
+        assertEq(after_.length, owners.length, "same count");
+        assertEq(after_[after_.length - 1], newOwner, "owner was swapped");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -982,29 +996,14 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_15_NEG_changeThreshold_on_safe() public {
-        address owner1 = makeAddr("thresh_owner1");
-        address owner2 = makeAddr("thresh_owner2");
+        assertEq(ISafe(GNOSIS_SAFE).getThreshold(), 3);
 
-        // Deploy Safe with 2 owners, threshold=1
-        address safe;
-        {
-            address[] memory owners = new address[](2);
-            owners[0] = owner1;
-            owners[1] = owner2;
-            bytes memory init = abi.encodeCall(
-                ISafe.setup,
-                (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
-            );
-            safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
-                SAFE_SINGLETON, init, block.timestamp + 2
-            );
-        }
+        _safeExec(
+            GNOSIS_SAFE, 0,
+            abi.encodeCall(ISafe.changeThreshold, (4)),
+            0
+        );
 
-        assertEq(ISafe(safe).getThreshold(), 1);
-
-        vm.prank(safe);
-        ISafe(safe).changeThreshold(2);
-
-        assertEq(ISafe(safe).getThreshold(), 2, "threshold changed to 2");
+        assertEq(ISafe(GNOSIS_SAFE).getThreshold(), 4, "threshold changed");
     }
 }
