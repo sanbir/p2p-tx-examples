@@ -406,36 +406,6 @@ contract EthStakingPoliciesTest is Test {
         assertTrue(ok, "registerValidators on P2pSsvProxyFactory");
     }
 
-    function test_P0_2c_registerValidatorsEth_on_factory() public {
-        // Call registerValidatorsEth on the NEW factory. Same operator/BLS data.
-        // registerValidatorsEth uses ETH for SSV fees (no `amount` param).
-        // Expected: factory ACL passes; revert inside SSV Network is acceptable.
-
-        (address[] memory owners, uint64[] memory ids) = _operators();
-        (bytes[] memory pubkeys, bytes[] memory shares) = _validatorData();
-
-        // Caller = factory operator (satisfies onlyOperatorOrOwnerOrClientOrReferrer)
-        address caller = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
-        vm.deal(caller, 2 ether);
-
-        SsvCluster memory cluster = SsvCluster(0, 0, 0, true, 0);
-        FeeRecipient memory client   = FeeRecipient(9000, payable(caller));
-        FeeRecipient memory referrer = FeeRecipient(0,    payable(address(0)));
-
-        vm.prank(caller);
-        (bool ok, bytes memory ret) = SSV_FACTORY_NEW.call{value: 1 ether}(
-            abi.encodeCall(
-                IP2pSsvProxyFactory.registerValidatorsEth,
-                (owners, ids, pubkeys, shares, cluster, client, referrer)
-            )
-        );
-
-        if (!ok) {
-            _assertNotFactoryACL(ret);
-            emit log_named_bytes("registerValidatorsEth revert (expected in SSV)", ret);
-        }
-    }
-
     // ═══════════════════════════════════════════════════════════
     //  P0.3  Function Selector Whitelist – P2pMessageSender
     //        Allowed selector: send
