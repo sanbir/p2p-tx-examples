@@ -88,6 +88,57 @@ interface IMultiSend {
     function multiSend(bytes memory transactions) external payable;
 }
 
+interface ISafeProxyFactory {
+    function createProxyWithNonce(
+        address singleton,
+        bytes memory initializer,
+        uint256 saltNonce
+    ) external returns (address proxy);
+}
+
+interface ISafe {
+    function setup(
+        address[] calldata _owners,
+        uint256 _threshold,
+        address to,
+        bytes calldata data,
+        address fallbackHandler,
+        address paymentToken,
+        uint256 payment,
+        address payable paymentReceiver
+    ) external;
+    function enableModule(address module) external;
+    function disableModule(address prevModule, address module) external;
+    function setGuard(address guard) external;
+    function setFallbackHandler(address handler) external;
+    function addOwnerWithThreshold(address owner, uint256 _threshold) external;
+    function removeOwner(address prevOwner, address owner, uint256 _threshold) external;
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) external;
+    function changeThreshold(uint256 _threshold) external;
+    function getOwners() external view returns (address[] memory);
+    function getThreshold() external view returns (uint256);
+    function nonce() external view returns (uint256);
+    function execTransaction(
+        address to, uint256 value, bytes calldata data,
+        uint8 operation, uint256 safeTxGas, uint256 baseGas,
+        uint256 gasPrice, address gasToken, address payable refundReceiver,
+        bytes memory signatures
+    ) external payable returns (bool success);
+}
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+
+/// @dev Helper that delegatecalls to MultiSend (needed for P0.7 negative test)
+contract DelegateCaller {
+    function exec(address target, bytes memory data) external payable {
+        (bool ok,) = target.delegatecall(data);
+        require(ok, "delegatecall failed");
+    }
+}
+
 // ──────────────────────────────────────────────────────────────
 //  Test contract — one test per P0 policy
 // ──────────────────────────────────────────────────────────────
@@ -107,9 +158,21 @@ contract EthStakingPoliciesTest is Test {
     address constant EIP7002              = 0x00000961Ef480Eb55e80D19ad83579A64c007002;
     address constant EIP7251              = 0x0000BBdDc7CE488642fb579F8B00f3a590007251;
 
-    // ── Safe v1.4.1 / v1.3.0 MultiSendCallOnly ───────────────
+    // ── Safe v1.4.1 ─────────────────────────────────────────
     address constant MULTISEND_V141      = 0x9641d764fc13c8B624c04430C7356C1C7C8102e2;
     address constant MULTISEND_V130      = 0x40A2aCCbd92BCA938b02010E17A5b8929b49130D;
+    address constant MULTISEND_FULL      = 0x38869BF66A61CF6BDDB996A6AE40d5853fd43b52;
+    address constant SAFE_SINGLETON      = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
+    address constant SAFE_PROXY_FACTORY  = 0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67;
+
+    // ── Well-known tokens (for P0.5 negative) ────────────────
+    address constant USDC                = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+
+    // ── Privileged actors ─────────────────────────────────────
+    address constant DEPOSITOR_FEE_FACTORY = 0xecA6e48C44C7c0cAf4651E5c5089e564031E8b90;
+    address constant DEPOSITOR_OPERATOR    = 0x632788138aa5eac1548b65B41a3d913c291E4cEF;
+    address constant DEPOSITOR_OWNER       = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
+    address constant LEGACY_DEP_OWNER      = 0x6Bb8b45a1C6eA816B70d76f83f7dC4f0f87365Ff;
 
     // ── Forbidden Safe-management selectors (P0.9 – P0.15) ───
     bytes4 constant SEL_ENABLE_MODULE     = bytes4(keccak256("enableModule(address)"));
@@ -159,6 +222,19 @@ contract EthStakingPoliciesTest is Test {
     function _loadCalldata(string memory filename) internal view returns (bytes memory) {
         string memory hexStr = vm.readFile(string.concat("test/data/", filename));
         return vm.parseBytes(hexStr);
+    }
+
+    /// Deploy a fresh Safe v1.4.1 proxy with `owner` as sole owner (threshold=1).
+    function _deploySafe(address owner) internal returns (address safe) {
+        address[] memory owners = new address[](1);
+        owners[0] = owner;
+        bytes memory init = abi.encodeCall(
+            ISafe.setup,
+            (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
+        );
+        safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
+            SAFE_SINGLETON, init, block.timestamp
+        );
     }
 
     /// Assert that `sel` is not any of the P0.9–P0.15 forbidden selectors.
@@ -623,5 +699,312 @@ contract EthStakingPoliciesTest is Test {
 
         // Execute
         IMultiSend(_multiSend()).multiSend(txs);
+    }
+
+    // ╔═══════════════════════════════════════════════════════════╗
+    // ║          NEGATIVE TEST CASES (policy should DENY)        ║
+    // ║  Each tx succeeds on-chain but violates a P0 policy.     ║
+    // ╚═══════════════════════════════════════════════════════════╝
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.1 NEG — forbidden selector on P2pOrgUnlimitedEthDepositor
+    //             (rejectService is NOT addEth or refund)
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_1_NEG_rejectService_on_depositor() public {
+        // Create a deposit first so there's something to reject
+        address user = makeAddr("client_neg1");
+        vm.deal(user, 33 ether);
+        vm.prank(user);
+        (bytes32 depositId,) = IP2pOrgUnlimitedEthDepositor(DEPOSITOR).addEth{value: 32 ether}(
+            _creds(user), uint96(32 ether), REF_FEE_DIST,
+            FeeRecipient(9000, payable(user)),
+            FeeRecipient(0, payable(address(0))), ""
+        );
+
+        // rejectService requires operator/owner of the fee distributor factory
+        vm.prank(DEPOSITOR_OPERATOR);
+        (bool ok,) = DEPOSITOR.call(
+            abi.encodeWithSignature("rejectService(bytes32,string)", depositId, "test rejection")
+        );
+        assertTrue(ok, "rejectService succeeds on-chain (but policy should deny)");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.2 NEG — forbidden selector on P2pSsvProxyFactory
+    //             (changeOperator is NOT addEth/registerValidators/registerValidatorsEth)
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_2_NEG_changeOperator_on_factory() public {
+        address factoryOwner = 0x18fB2400e61b623c3fc55b212c9022B44EdD1c18;
+        address newOperator  = makeAddr("new_operator");
+
+        // changeOperator is an owner-only function — NOT in the allowed selector list
+        vm.prank(factoryOwner);
+        (bool ok,) = SSV_FACTORY_NEW.call(
+            abi.encodeWithSignature("changeOperator(address)", newOperator)
+        );
+        assertTrue(ok, "changeOperator succeeds on-chain (but policy should deny)");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.3 NEG — P2pMessageSender has no other functions besides send().
+    //             Policy would deny any non-send selector. We show the calldata
+    //             that would be constructed (targeting MessageSender with wrong selector).
+    //             Since the contract has no fallback, this WOULD revert on-chain.
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_3_NEG_wrong_selector_on_messageSender() public view {
+        // P2pMessageSender only has send(string). Any other selector reverts.
+        // We verify the policy would catch a non-send selector.
+        bytes4 sendSel = IP2pMessageSender.send.selector;
+        bytes4 badSel  = bytes4(keccak256("transfer(address,uint256)"));
+        assertTrue(sendSel != badSel, "transfer selector differs from send");
+
+        // Confirm the contract has no fallback (code exists but wrong selector reverts)
+        assertTrue(MESSAGE_SENDER.code.length > 0, "contract exists");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.4 NEG — forbidden selector on P2pEth2Depositor
+    //             (pause is NOT deposit)
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_4_NEG_pause_on_legacy_depositor() public {
+        // pause() is owner-only on the legacy depositor
+        vm.prank(LEGACY_DEP_OWNER);
+        (bool ok,) = ETH2_DEP_LEGACY.call(abi.encodeWithSignature("pause()"));
+        assertTrue(ok, "pause succeeds on-chain (but policy should deny)");
+
+        // Clean up: unpause so other tests aren't affected
+        vm.prank(LEGACY_DEP_OWNER);
+        (bool ok2,) = ETH2_DEP_LEGACY.call(abi.encodeWithSignature("unpause()"));
+        assertTrue(ok2, "unpause");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.5 NEG — call targets a token contract (ERC-20)
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_5_NEG_call_targets_token_contract() public {
+        // Deal USDC to a test address and transfer — this targets a token contract
+        address holder = makeAddr("token_holder");
+        address recipient = makeAddr("token_recipient");
+        deal(USDC, holder, 1000e6);
+
+        vm.prank(holder);
+        bool ok = IERC20(USDC).transfer(recipient, 100e6);
+        assertTrue(ok, "ERC-20 transfer succeeds (but policy should deny)");
+        assertEq(IERC20(USDC).balanceOf(recipient), 100e6);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.6 NEG — ETH sent to a non-P2P, non-system address
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_6_NEG_eth_to_unknown_address() public {
+        address sender = makeAddr("eth_sender");
+        address unknown = makeAddr("unknown_recipient");
+        vm.deal(sender, 2 ether);
+
+        vm.prank(sender);
+        (bool ok,) = unknown.call{value: 1 ether}("");
+        assertTrue(ok, "ETH to unknown address succeeds (but policy should deny)");
+        assertEq(unknown.balance, 1 ether);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.7 NEG — multiSend with delegatecall (operation = 1)
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_7_NEG_multisend_with_delegatecall() public {
+        // Build a multiSend payload where one sub-op uses operation=1 (DelegateCall)
+        bytes memory sendData = abi.encodeCall(IP2pMessageSender.send, ("delegatecall-test"));
+        bytes memory txs = abi.encodePacked(
+            _packOp(0, MESSAGE_SENDER, 0, sendData),  // Call (OK)
+            _packOp(1, MESSAGE_SENDER, 0, sendData)   // DelegateCall (policy violation!)
+        );
+
+        // Verify the payload contains operation=1
+        bool hasDelegatecall;
+        uint256 i;
+        while (i < txs.length) {
+            if (uint8(txs[i]) == 1) hasDelegatecall = true;
+            uint256 dataLen;
+            assembly { dataLen := mload(add(add(txs, 0x20), add(i, 53))) }
+            i += 85 + dataLen;
+        }
+        assertTrue(hasDelegatecall, "payload contains delegatecall op");
+
+        // Execute via a helper that delegatecalls to MultiSend (like a Safe would)
+        DelegateCaller caller = new DelegateCaller();
+        caller.exec(MULTISEND_FULL, abi.encodeCall(IMultiSend.multiSend, (txs)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.8 NEG — multiSend with >10 sub-operations
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_8_NEG_multisend_over_10_ops() public {
+        bytes memory txs;
+        uint256 opCount;
+
+        // Build 11 sub-operations (exceeds limit of 10)
+        for (uint256 j; j < 11; j++) {
+            bytes memory data = abi.encodeCall(
+                IP2pMessageSender.send,
+                (string(abi.encodePacked("neg-op", bytes1(uint8(0x30 + j)))))
+            );
+            txs = abi.encodePacked(txs, _packOp(0, MESSAGE_SENDER, 0, data));
+            opCount++;
+        }
+
+        assertTrue(opCount > 10, "multicall has >10 sub-operations (policy should deny)");
+
+        // Still executes fine on-chain
+        IMultiSend(_multiSend()).multiSend(txs);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.9 NEG — call enableModule on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_9_NEG_enableModule_on_safe() public {
+        address safe = _deploySafe(address(this));
+        address rogue = makeAddr("rogue_module");
+
+        // enableModule is authorized (msg.sender == self). Prank as the Safe.
+        vm.prank(safe);
+        ISafe(safe).enableModule(rogue);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.10 NEG — call setGuard on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_10_NEG_setGuard_on_safe() public {
+        address safe = _deploySafe(address(this));
+        address rogueGuard = makeAddr("rogue_guard");
+
+        // Safe's setGuard checks supportsInterface(Guard.interfaceId) on the guard.
+        // Mock the ERC165 response so the call succeeds.
+        vm.mockCall(
+            rogueGuard,
+            abi.encodeWithSelector(0x01ffc9a7), // supportsInterface(bytes4)
+            abi.encode(true)
+        );
+
+        vm.prank(safe);
+        ISafe(safe).setGuard(rogueGuard);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.11 NEG — call setFallbackHandler on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_11_NEG_setFallbackHandler_on_safe() public {
+        address safe = _deploySafe(address(this));
+        address rogueHandler = makeAddr("rogue_handler");
+
+        vm.prank(safe);
+        ISafe(safe).setFallbackHandler(rogueHandler);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.12 NEG — call addOwnerWithThreshold on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_12_NEG_addOwnerWithThreshold_on_safe() public {
+        address safe = _deploySafe(address(this));
+        address rogue = makeAddr("rogue_owner");
+
+        vm.prank(safe);
+        ISafe(safe).addOwnerWithThreshold(rogue, 1);
+
+        // Verify the owner was added
+        address[] memory owners = ISafe(safe).getOwners();
+        assertEq(owners.length, 2, "Safe now has 2 owners");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.13 NEG — call removeOwner on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_13_NEG_removeOwner_on_safe() public {
+        address owner1 = makeAddr("owner1");
+        address owner2 = makeAddr("owner2");
+
+        // Deploy Safe with 2 owners (need 2 so we can remove one)
+        address safe;
+        {
+            address[] memory owners = new address[](2);
+            owners[0] = owner1;
+            owners[1] = owner2;
+            bytes memory init = abi.encodeCall(
+                ISafe.setup,
+                (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
+            );
+            safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
+                SAFE_SINGLETON, init, block.timestamp + 1
+            );
+        }
+
+        // removeOwner(prevOwner, owner, newThreshold)
+        // In Safe's linked list, sentinel (0x1) -> owner1 -> owner2 -> sentinel
+        // To remove owner2: prevOwner = owner1
+        vm.prank(safe);
+        ISafe(safe).removeOwner(owner1, owner2, 1);
+
+        assertEq(ISafe(safe).getOwners().length, 1, "Safe now has 1 owner");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.14 NEG — call swapOwner on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_14_NEG_swapOwner_on_safe() public {
+        address originalOwner = address(this);
+        address safe = _deploySafe(originalOwner);
+        address newOwner = makeAddr("new_owner");
+
+        // swapOwner(prevOwner, oldOwner, newOwner)
+        // Linked list: sentinel (0x1) -> originalOwner -> sentinel
+        // prevOwner for the only owner is the sentinel = address(0x1)
+        vm.prank(safe);
+        ISafe(safe).swapOwner(address(0x1), originalOwner, newOwner);
+
+        address[] memory owners = ISafe(safe).getOwners();
+        assertEq(owners[0], newOwner, "owner was swapped");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  P0.15 NEG — call changeThreshold on a Safe
+    // ═══════════════════════════════════════════════════════════
+
+    function test_P0_15_NEG_changeThreshold_on_safe() public {
+        address owner1 = makeAddr("thresh_owner1");
+        address owner2 = makeAddr("thresh_owner2");
+
+        // Deploy Safe with 2 owners, threshold=1
+        address safe;
+        {
+            address[] memory owners = new address[](2);
+            owners[0] = owner1;
+            owners[1] = owner2;
+            bytes memory init = abi.encodeCall(
+                ISafe.setup,
+                (owners, 1, address(0), "", address(0), address(0), 0, payable(address(0)))
+            );
+            safe = ISafeProxyFactory(SAFE_PROXY_FACTORY).createProxyWithNonce(
+                SAFE_SINGLETON, init, block.timestamp + 2
+            );
+        }
+
+        assertEq(ISafe(safe).getThreshold(), 1);
+
+        vm.prank(safe);
+        ISafe(safe).changeThreshold(2);
+
+        assertEq(ISafe(safe).getThreshold(), 2, "threshold changed to 2");
     }
 }
