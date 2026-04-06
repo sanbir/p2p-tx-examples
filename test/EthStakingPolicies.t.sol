@@ -36,6 +36,21 @@ interface IP2pOrgUnlimitedEthDepositor {
     function depositAmount(bytes32) external view returns (uint112);
     function depositExpiration(bytes32) external view returns (uint40);
     function supportsInterface(bytes4) external view returns (bool);
+    function getDepositId(
+        bytes32 _eth2WithdrawalCredentials,
+        uint96  _ethAmountPerValidatorInWei,
+        address _referenceFeeDistributor,
+        FeeRecipient calldata _clientConfig,
+        FeeRecipient calldata _referrerConfig
+    ) external view returns (bytes32);
+}
+
+interface IFeeDistributorFactory {
+    function predictFeeDistributorAddress(
+        address _referenceFeeDistributor,
+        FeeRecipient calldata _clientConfig,
+        FeeRecipient calldata _referrerConfig
+    ) external view returns (address);
 }
 
 struct SsvCluster {
@@ -512,24 +527,25 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_7_multisend_no_delegatecall() public {
-        // Safe executes a multiSend (DelegateCall to MultiSend singleton)
-        // where every sub-operation uses operation=0 (Call), not delegatecall.
+        // Safe batches 3 different P2P calls via MultiSend — all operation=0 (Call).
         bytes memory txs = abi.encodePacked(
-            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op1"))),
-            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op2"))),
-            _packOp(0, MESSAGE_SENDER, 0, abi.encodeCall(IP2pMessageSender.send, ("p07-op3")))
+            _packOp(0, MESSAGE_SENDER, 0,
+                abi.encodeCall(IP2pMessageSender.send, ('{"action":"status"}'))),
+            _packOp(0, DEPOSITOR, 0,
+                abi.encodeWithSelector(IP2pOrgUnlimitedEthDepositor.totalBalance.selector)),
+            _packOp(0, SSV_FACTORY_NEW, 0,
+                abi.encodeWithSelector(IP2pSsvProxyFactory.getReferenceFeeDistributor.selector))
         );
 
-        // Verify every sub-op has operation = 0 (Call)
+        // Verify every sub-op has operation = 0
         uint256 i;
         while (i < txs.length) {
-            assertEq(uint8(txs[i]), 0, "all ops must be Call(0), not DelegateCall(1)");
+            assertEq(uint8(txs[i]), 0, "all ops must be Call(0)");
             uint256 dataLen;
             assembly { dataLen := mload(add(add(txs, 0x20), add(i, 53))) }
             i += 85 + dataLen;
         }
 
-        // Execute through the real Gnosis DAO Safe (DelegateCall to MultiSend)
         _safeExec(MULTISEND_FULL, 0, abi.encodeCall(IMultiSend.multiSend, (txs)), 1);
     }
 
@@ -538,89 +554,149 @@ contract EthStakingPoliciesTest is Test {
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_8_multisend_max_10_ops() public {
-        // Safe executes a multiSend with 5 sub-operations (≤10 limit)
-        bytes memory txs;
-        uint256 opCount;
-        for (uint256 j; j < 5; j++) {
-            txs = abi.encodePacked(txs, _packOp(0, MESSAGE_SENDER, 0,
-                abi.encodeCall(IP2pMessageSender.send,
-                    (string(abi.encodePacked("p08-op", bytes1(uint8(0x30 + j))))))));
-            opCount++;
-        }
-        assertTrue(opCount <= 10, "at most 10 sub-operations");
+        // Safe batches 5 different P2P calls (≤10 limit).
+        bytes memory txs = abi.encodePacked(
+            _packOp(0, MESSAGE_SENDER, 0,
+                abi.encodeCall(IP2pMessageSender.send, ('{"action":"ping"}'))),
+            _packOp(0, DEPOSITOR, 0,
+                abi.encodeWithSelector(IP2pOrgUnlimitedEthDepositor.totalBalance.selector)),
+            _packOp(0, DEPOSITOR, 0,
+                abi.encodeCall(IP2pOrgUnlimitedEthDepositor.supportsInterface, (bytes4(0x01ffc9a7)))),
+            _packOp(0, SSV_FACTORY_NEW, 0,
+                abi.encodeWithSelector(IP2pSsvProxyFactory.getReferenceFeeDistributor.selector)),
+            _packOp(0, SSV_FACTORY_NEW, 0,
+                abi.encodeCall(IP2pSsvProxyFactory.supportsInterface, (bytes4(0x01ffc9a7))))
+        );
+
         _safeExec(MULTISEND_FULL, 0, abi.encodeCall(IMultiSend.multiSend, (txs)), 1);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.9  Safe Management – no enableModule / disableModule
+    //        Positive: Safe → addEth on P2pOrgUnlimitedEthDepositor
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_9_no_enableModule_disableModule() public {
-        // Safe calls P2pMessageSender.send (allowed) — selector ≠ enableModule/disableModule
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p09-test"));
-        bytes4 sel = bytes4(data);
-        assertTrue(sel != SEL_ENABLE_MODULE && sel != SEL_DISABLE_MODULE);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        vm.deal(SAFE_ADDR, 33 ether);
+        bytes memory data = abi.encodeCall(
+            IP2pOrgUnlimitedEthDepositor.addEth,
+            (_creds(SAFE_ADDR), uint96(32 ether), REF_FEE_DIST,
+             FeeRecipient(9000, payable(SAFE_ADDR)),
+             FeeRecipient(0, payable(address(0))), "")
+        );
+        assertTrue(bytes4(data) != SEL_ENABLE_MODULE && bytes4(data) != SEL_DISABLE_MODULE);
+        _safeExec(DEPOSITOR, 32 ether, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.10  Safe Management – no setGuard
+    //         Positive: Safe → refund on P2pOrgUnlimitedEthDepositor
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_10_no_setGuard() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p10-test"));
-        assertTrue(bytes4(data) != SEL_SET_GUARD);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        vm.deal(SAFE_ADDR, 33 ether);
+        // 1. addEth via Safe
+        _safeExec(DEPOSITOR, 32 ether, abi.encodeCall(
+            IP2pOrgUnlimitedEthDepositor.addEth,
+            (_creds(SAFE_ADDR), uint96(32 ether), REF_FEE_DIST,
+             FeeRecipient(9000, payable(SAFE_ADDR)),
+             FeeRecipient(0, payable(address(0))), "")
+        ), 0);
+
+        // 2. Compute the depositId + fee distributor address to refund
+        bytes32 depositId = IP2pOrgUnlimitedEthDepositor(DEPOSITOR).getDepositId(
+            _creds(SAFE_ADDR), uint96(32 ether), REF_FEE_DIST,
+            FeeRecipient(9000, payable(SAFE_ADDR)),
+            FeeRecipient(0, payable(address(0)))
+        );
+        uint40 expiry = IP2pOrgUnlimitedEthDepositor(DEPOSITOR).depositExpiration(depositId);
+        vm.warp(uint256(expiry) + 1);
+
+        // 3. refund via Safe — selector ≠ setGuard
+        // We need the feeDistributor address. Read it from depositId.
+        // Actually the depositor returns it from addEth. Since we used _safeExec
+        // (which doesn't return data), we predict the address using getDepositId
+        // with the 3-param overload.
+        address feeDist;
+        {
+            // The fee distributor was created deterministically by the factory.
+            // We can compute: getDepositId(creds, amount, feeDist) == depositId
+            // But we need feeDist. Let's read it from the event or predict via factory.
+            // Simplest: use the 3-param getDepositId to verify — but we need feeDist.
+            // Alternative: just use the overloaded getDepositId that takes the refs.
+            // The factory predicts the address. Let's get it from the factory.
+            feeDist = IFeeDistributorFactory(0xecA6e48C44C7c0cAf4651E5c5089e564031E8b90)
+                .predictFeeDistributorAddress(REF_FEE_DIST,
+                    FeeRecipient(9000, payable(SAFE_ADDR)),
+                    FeeRecipient(0, payable(address(0))));
+        }
+
+        bytes memory refundData = abi.encodeCall(
+            IP2pOrgUnlimitedEthDepositor.refund,
+            (_creds(SAFE_ADDR), uint96(32 ether), feeDist)
+        );
+        assertTrue(bytes4(refundData) != SEL_SET_GUARD);
+        _safeExec(DEPOSITOR, 0, refundData, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.11  Safe Management – no setFallbackHandler
+    //         Positive: Safe → send on P2pMessageSender
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_11_no_setFallbackHandler() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p11-test"));
+        bytes memory data = abi.encodeCall(IP2pMessageSender.send,
+            ('{"action":"withdraw","pubkeys":["0xabc123"]}'));
         assertTrue(bytes4(data) != SEL_SET_FALLBACK);
         _safeExec(MESSAGE_SENDER, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.12  Safe Management – no addOwnerWithThreshold
+    //         Positive: Safe → totalBalance on P2pOrgUnlimitedEthDepositor
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_12_no_addOwnerWithThreshold() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p12-test"));
+        bytes memory data = abi.encodeWithSelector(
+            IP2pOrgUnlimitedEthDepositor.totalBalance.selector);
         assertTrue(bytes4(data) != SEL_ADD_OWNER);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        _safeExec(DEPOSITOR, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.13  Safe Management – no removeOwner
+    //         Positive: Safe → supportsInterface on Depositor
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_13_no_removeOwner() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p13-test"));
+        bytes memory data = abi.encodeCall(
+            IP2pOrgUnlimitedEthDepositor.supportsInterface, (bytes4(0x01ffc9a7)));
         assertTrue(bytes4(data) != SEL_REMOVE_OWNER);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        _safeExec(DEPOSITOR, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.14  Safe Management – no swapOwner
+    //         Positive: Safe → getReferenceFeeDistributor on Factory
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_14_no_swapOwner() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p14-test"));
+        bytes memory data = abi.encodeWithSelector(
+            IP2pSsvProxyFactory.getReferenceFeeDistributor.selector);
         assertTrue(bytes4(data) != SEL_SWAP_OWNER);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        _safeExec(SSV_FACTORY_NEW, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  P0.15  Safe Management – no changeThreshold
+    //         Positive: Safe → supportsInterface on Factory
     // ═══════════════════════════════════════════════════════════
 
     function test_P0_15_no_changeThreshold() public {
-        bytes memory data = abi.encodeCall(IP2pMessageSender.send, ("p15-test"));
+        bytes memory data = abi.encodeCall(
+            IP2pSsvProxyFactory.supportsInterface, (bytes4(0x01ffc9a7)));
         assertTrue(bytes4(data) != SEL_CHANGE_THRESHOLD);
-        _safeExec(MESSAGE_SENDER, 0, data, 0);
+        _safeExec(SSV_FACTORY_NEW, 0, data, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
