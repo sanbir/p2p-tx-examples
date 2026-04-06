@@ -4,7 +4,8 @@ out = "out"
 libs = ["lib"]
 solc = "0.8.24"
 evm_version = "cancun"
-fs_permissions = [{ access = "read", path = "test/data" }]
+via_ir = true  # required by GenerateTxTable.t.sol (stack too deep without it)
+fs_permissions = [{ access = "read", path = "test/data" }, { access = "read-write", path = "Tx-Data-Table.md" }]
 
 [rpc_endpoints]
 mainnet = "${MAINNET_RPC_URL}"
